@@ -60,7 +60,10 @@
 
 	Info chunks tells us about the marker entry. Info chunks are either standard format, if byte 1 <= 0x7F, or
 	custom format when the byte 1 > 0x7F. Standard format info chunks have a following value chunk and then they
-	end. Custom info chunks have chunks following equal to ((byte 2) + (byte 3) << 8) = 0 to 65536 chunks following.
+	end.
+
+	Custom info chunks have chunks following equal to ((byte 2) + (byte 3) << 8) = 0 to 2047 chunks following.
+	8kb size limit for these is hard enforced.
 
 	Marker 0 (total archive entry) must contain these info chunks, the type of which is determined by byte 2:
 
@@ -105,6 +108,7 @@
 
 	 	0   1   2   3
 		[>4][XX][XX][XX] = CUSTOM USER CHUNK => (byte 1) is user set. byte 2 + (byte 3 << 8) are bytes that follow to complete the chunk.
+												following bytes must be aligned into chunk size.
 
 	Callbacks for custom chunks can be set in the context, allowing you to handle them.
 
@@ -122,18 +126,18 @@
 
 	----
 
-	The error policy of lzz is:
+	The error policy of *zz is:
 		- ignore what you don't understand.
 			As long as the archive contains a properly configured marker entry 0 and 1 or more
 			following entries with at least an EXTENSION info chunk each, it is valid.
 			This makes it very extendable as needed to your purposes.
 
-		This means these 44 bytes are a valid lzz archive:
+		This means these 44 bytes are a valid *zz archive:
 
 			[00][00][00][00] - marker entry zero
 			[02][00][00][00]
 			[01][00][00][00] - INFO: 1 contained entry
-			[02][01][24][00]
+			[02][01][2C][00]
 			[00][00][00][00] - INFO: 44 bytes total for this archive
 			[02][03][6E][6F]
 			[64][61][74][61] - INFO: extension = 'nodata'
@@ -145,9 +149,8 @@
 		It's an empty, dummy archive with no contents, but valid by all rules.
 
 	There are no hard rules for when to add the ELF CRC integrity chunks. The code here inserts
-	one after every 64kb of data, and one before the STOP at the end. You could just as well
-	add one at the end of every entry, etc. You could ignore them all too, given lz4 has it's own
-	checksum techniques.
+	one at the end of every entry, and one before the STOP at the end. You could ignore them all 
+	too, it is up the end software.
 
 	----
 
@@ -155,14 +158,17 @@
 	.lzz which is LZ4 ran on the full archive (solid) data.
 */
 
+
+#include <stddef.h>
+
 typedef void (*LZZERROR)(const char *error);
 typedef void* (*LZZMUTEX)();
 typedef void (*LZZLOCK)(void *p);
 typedef void (*LZZUNLOCK)(void *p);
 
-typedef void* (*LZZCALLOC)(unsigned long long num, unsigned long long sz);
-typedef void* (*LZZMALLOC)(unsigned long long sz);
-typedef void* (*LZZREALLOC)(void *p, unsigned long long sz);
+typedef void* (*LZZCALLOC)(size_t num, size_t  sz);
+typedef void* (*LZZMALLOC)(size_t num);
+typedef void* (*LZZREALLOC)(void *p, size_t num);
 typedef void (*LZZFREE)(void *p);
 
 typedef int (*LZ4READ)(void *io, char *buffer, int bufferLength);
@@ -185,15 +191,21 @@ typedef struct _lzzChunk {
 	};
 } lzzChunk;
 
-typedef struct _lzzBlock {
-	unsigned int count;
-	lzzChunk *chunk;
-} lzzBlock;
+typedef struct _lzzString {
+	const char *str;
+	unsigned int len;
+} lzzString;
+
+typedef struct _lzzTag {
+	unsigned int num;
+	lzzString name;
+	lzzString value;
+} lzzTag;
 
 typedef struct _lzzBlockArray {
 	unsigned int count;
 	unsigned int max;
-	lzzBlock *block;
+	lzzChunk *chunk;
 } lzzBlockArray;
 
 typedef struct _lzzCodeLine {
@@ -212,6 +224,7 @@ typedef struct _lzzEntry {
 	char *mime;
 	unsigned int uid;
 	unsigned int inheritTagId;
+	void *user;
 } lzzEntry;
 
 typedef struct _lzzEntryArray {
@@ -220,10 +233,11 @@ typedef struct _lzzEntryArray {
 	lzzEntry *entry;
 } lzzEntryArray;
 
-typedef struct _lzzError {
-	const char *error;
-	void *next;
-} lzzError;
+typedef struct _lzzErrors {
+	char errBuffer[2048];
+	unsigned short errIndex[15];
+	unsigned short errCount;
+} lzzErrors;
 
 typedef lzzIO (*LZZFETCH)(int entry_num, const char *title, const char *extension, const char *mime, unsigned int uid);
 
@@ -231,13 +245,19 @@ typedef struct _lzzArchive {
 	unsigned long long totalBytes;
 	unsigned int count;
 	lzzEntryArray table;
-	lzzError *err;
-	lzzError *pos;
+	lzzErrors e;
 	LZZFETCH fetch;
+	lzzBlockArray *fixedArray;
 	void *safety;
+	void *user;
 } lzzArchive;
 
 #define lzzMessage lzzArchive
+
+// 8kb chunk buffer built into the parser state
+typedef struct _lzzParserBuffer {
+	lzzChunk data[2048];
+} lzzParserBuffer;
 
 typedef struct _lzzParserState {
 	int markerId;
@@ -246,7 +266,12 @@ typedef struct _lzzParserState {
 	unsigned long long pos;
 	unsigned long long totalBytes;
 	unsigned int inheritUid;
-	char seek[8192];
+	lzzIO *io;
+	lzzEntry *entry;
+	lzzArchive *arc;
+	lzzBlockArray block;
+	lzzBlockArray blk;
+	lzzParserBuffer buffer;
 } lzzParserState;
 
 // this is called first with block set to NULL, if you return an int, it'll read that many chunks into block and call it again.
@@ -262,8 +287,11 @@ typedef struct _lzzContext {
 	LZZREALLOC realloc;
 	LZZFREE free;
 	LZZ_CUSTOM_CALLBACK custom[256];
-	unsigned int customInfoLimit;
+	unsigned int blocksFixed;
+	unsigned int entriesFixed;
+	unsigned int customLimit;
 	unsigned long long bytesAllocated;
+	void *user;
 } lzzContext;
 
 typedef int (*LZZFILTER)(void *p, lzzEntry *entry);
@@ -276,8 +304,9 @@ typedef int (*LZZFILTER)(void *p, lzzEntry *entry);
 #define LZZ_READ_HALT		(2 << 8) 	// halt on any error (usually ignore and press forward)
 #define LZZ_READ_HALTHASH	(3 << 8) 	// halt on any hash error (implied by READ_HALT for all errors)
 
-#define LZZ_FAST	 	0		// fast compression
-#define LZZ_HC		 	1 		// full slow compression
+#define LZZ_MODE_FAST 	0		// fast compression
+#define LZZ_MODE_HC		1 		// full slow compression
+#define LZZ_MODE_FLAT	2		// uncompressed
 
 // create and destroy a context
 lzzContext *lzzCreateContext(LZZERROR err, LZZCALLOC c);	// c may be 0/NULL to use C's calloc internally
@@ -289,16 +318,19 @@ void lzzMakeSafeContext(lzzContext *context, LZZMUTEX m, LZZLOCK l, LZZUNLOCK u)
 // add your own calloc, malloc, realloc, and free here
 void lzzMakeMemoryContext(lzzContext *context, LZZMALLOC m, LZZCALLOC c, LZZREALLOC r, LZZFREE f);
 
-// this reports how many bytes of memory a fast limited memory context will use
-unsigned long long lzzSizeOfMemoryContextFastLimited(lzzContext *context, unsigned long max_entries, unsigned long max_tags,
-						unsigned long max_info, unsigned long max_data);
+// use a fixed size (no-allocation) archive context, you can never read anything
+// with more blocks than set here and archives always take this many blocks of memory even if smaller
+// entries can be 0, and if so 800 will be allocated, about ~63kb on a 64-bit system
+void lzzMakeMemoryContextFixed(lzzContext *context, unsigned int blocks, unsigned int entries);
 
-// use a fast limited memory context (pre-allocation of archives)
-void lzzMakeMemoryContextFastLimited(lzzContext *context, unsigned long max_entries, unsigned long max_tags,
-						unsigned long max_info, unsigned long max_data);
+// return to a dynamically allocated context if we were in ContextFastLimited (CFL) from above.
+void lzzMakeMemoryContextDynamic(lzzContext *context);
 
 // add a custom callback to the context
 void lzzSetCustomCallback(lzzContext *context, int typeCode, LZZ_CUSTOM_CALLBACK cb);
+
+// set the user pointer for this context (which will be added to all archives automatically but can be overridden)
+void lzzSetUserPointer(lzzContext *context, void *u);
 
 // read the info and tag chunks for an archive, ignore data chunks
 lzzArchive* lzzScanFile(lzzContext *context, const char *fname, int method);
@@ -306,16 +338,25 @@ lzzArchive* lzzScanMemory(lzzContext *context, const char *block, unsigned long 
 lzzArchive* lzzScanIO(lzzContext *context, lzzIO *io, int method);
 
 // just read everything, I suppose we might do this?
-lzzArchive* lzzReadFile(lzzContext *context, const char *fname, int method);
-lzzArchive* lzzReadMemory(lzzContext *context, const char *block, unsigned long long len, int method);
-lzzArchive* lzzReadIO(lzzContext *context, lzzIO *io, int method);
+lzzArchive* lzzReadFile(lzzContext *context, const char *fname, int flags);
+lzzArchive* lzzReadMemory(lzzContext *context, const char *block, unsigned long long len, int flags);
+lzzArchive* lzzReadIO(lzzContext *context, lzzIO *io, int flags);
+
+// these work with fixed memory context to re-use already allocated archive memory blocks
+void lzzScanFileInto(lzzContext *context, lzzArchive *arc, const char *fname, int flags);
+void lzzScanMemoryInto(lzzContext *context, lzzArchive *arc, const char *block, unsigned long long len, int flags);
+void lzzScanIOInto(lzzContext *context, lzzArchive *arc, lzzIO *io, int flags);
+void lzzReadFileInto(lzzContext *context, lzzArchive *arc, const char *fname, int flags);
+void lzzReadMemoryInto(lzzContext *context, lzzArchive *arc, const char *block, unsigned long long len, int flags);
+void lzzReadIOInto(lzzContext *context, lzzArchive *arc, lzzIO *io, int flags);
 
 // writing out an archive from memory
-unsigned long long lzzWriteFile(lzzContext *context, lzzArchive *arc, int how, const char *fname);
-unsigned long long lzzWriteMemory(lzzContext *context, lzzArchive *arc, int how, char **data);
-unsigned long long lzzWriteIO(lzzContext *context, lzzArchive *arc, int how, lzzIO *io, const char *fname);
+unsigned long long lzzWriteFile(lzzContext *context, lzzArchive *rac, int mode, const char *fname);
+unsigned long long lzzWriteMemory(lzzContext *context, lzzArchive *arc, int mode, char **data);
+unsigned long long lzzWriteIO(lzzContext *context, lzzArchive *arc, int mode, lzzIO *io);
 
 // just make an empty archive, so we can add to it in memory if we want to do that kind of thing
+// if you are in CFL = ContextFastLimited a full allocation is made for it outright
 lzzArchive* lzzEmptyArchive(lzzContext *context);
 
 // add entries to the archive
